@@ -25,6 +25,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <dirent.h>
+#include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -107,6 +109,11 @@ static uint32_t s_user_ram_size = 0;
 static int32_t s_user_ota_total_size = 0;
 static int32_t s_user_ota_recv_size = 0;
 static bool s_user_ota_is_chunked = true;
+static int s_user_wget_err = 0;
+static char *s_user_wget_file = NULL;
+static int32_t s_user_wget_max_len = 0;
+static int32_t s_user_wget_recv_size = 0;
+static int s_user_wget_fd = -1;
 static SemaphoreHandle_t s_at_user_sync_sema;
 
 static void at_user_wait_data_cb(void)
@@ -297,7 +304,7 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
         if (s_user_ota_is_chunked) {
             printf("receive len=%d, receive total len=%d\r\n", evt->data_len, s_user_ota_recv_size);
         } else {
-            printf("total_len=%d(%d), %0.1f%%!\r\n", s_user_ota_total_size, s_user_ota_recv_size, (s_user_ota_recv_size*1.0) * 100 / s_user_ota_total_size);
+            printf("total_len=%d(%d), %0.1f%%!\r\n", s_user_ota_total_size, s_user_ota_recv_size, (s_user_ota_recv_size * 1.0) * 100 / s_user_ota_total_size);
         }
 
         break;
@@ -403,11 +410,114 @@ static uint8_t at_setup_cmd_userota(uint8_t para_num)
         esp_at_response_result(ESP_AT_RESULT_CODE_OK);
         esp_at_port_wait_write_complete(ESP_AT_PORT_TX_WAIT_MS_MAX);
         esp_restart();
-        for(;;){
+        for (;;) {
         }
     } else {
         return ESP_AT_RESULT_CODE_ERROR;
     }
+}
+
+static esp_err_t _wget_event_handler(esp_http_client_event_t *evt)
+{
+    if (s_user_wget_err)
+        return ESP_AT_RESULT_CODE_ERROR;
+
+    if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
+        s_user_wget_fd = open(s_user_wget_file, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+        if (s_user_wget_fd < 0) {
+            s_user_wget_err = 1;
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+    } if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (s_user_wget_fd < 0) {
+            s_user_wget_err = 2;
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+
+        if (evt->data_len < 0) {
+            s_user_wget_err = 3;
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+
+        if (s_user_wget_max_len && ((s_user_wget_recv_size + evt->data_len) > s_user_wget_max_len)) {
+            s_user_wget_err = 4;
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+
+        if (write(s_user_wget_fd, evt->data, evt->data_len) != evt->data_len) {
+            s_user_wget_err = 5;
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+
+        s_user_wget_recv_size += evt->data_len;
+    }
+
+    return ESP_OK;
+}
+
+// AT+USERWGET="url","/fatfs/file"[,<max_len>][,<timeout>]
+static uint8_t at_setup_cmd_userwget(uint8_t para_num)
+{
+    char buffer[64];
+    uint8_t *url;
+    int32_t timeout;
+    esp_err_t err;
+
+    if (esp_at_get_para_as_str(0, &url) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        esp_at_port_write_data((uint8_t *)"\r\n+USERWGET: ERR1: 1\r\n", 22);
+
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    if (esp_at_get_para_as_str(1, (uint8_t **)&s_user_wget_file) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        esp_at_port_write_data((uint8_t *)"\r\n+USERWGET: ERR1: 2\r\n", 22);
+
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    s_user_wget_max_len = 0;
+    esp_at_get_para_as_digit(2, &s_user_wget_max_len);
+    timeout = 0;
+    esp_at_get_para_as_digit(3, &timeout);
+
+    s_user_wget_err = 0;
+    s_user_wget_recv_size = 0;
+    s_user_wget_fd = -1;
+
+    esp_http_client_config_t config = {
+        .url = (const char *)url,
+        .event_handler = _wget_event_handler,
+        .keep_alive_enable = true,
+        .timeout_ms = timeout * 1000,
+        .buffer_size = 2048,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    err = esp_http_client_perform(client);
+    esp_http_client_cleanup(client);
+
+    if (s_user_wget_fd >= 0)
+        close(s_user_wget_fd);
+
+    if (s_user_wget_err) {
+        snprintf(buffer, sizeof(buffer), "\r\n+USERWGET: ERR2: %d\r\n", s_user_wget_err);
+        esp_at_port_write_data((uint8_t *)buffer, strlen((char *)buffer));
+
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    if (err != ESP_OK) {
+        snprintf(buffer, sizeof(buffer), "\r\n+USERWGET: ERR3: %d\r\n", (int)err);
+        esp_at_port_write_data((uint8_t *)buffer, strlen((char *)buffer));
+
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    snprintf(buffer, sizeof(buffer), "\r\n+USERWGET: %d\r\n", (int)s_user_wget_recv_size);
+    esp_at_port_write_data((uint8_t *)buffer, strlen((char *)buffer));
+
+    return ESP_OK;
 }
 
 static uint8_t at_query_cmd_userdocs(uint8_t *cmd_name)
@@ -420,12 +530,12 @@ static uint8_t at_query_cmd_userdocs(uint8_t *cmd_name)
 
     // https:<hostname>/<project>/<language>/<version>/<target>/<home_web_page>
     ret += snprintf((char *)buffer + ret, AT_USERDOCS_BUFFER_LEN_MAX - ret, "%s:\"https://%s/%s/%s/%s/%s/%s\"\r\n",
-        cmd_name, AT_DOCS_SERVER_HOSTNAME, AT_DOCS_PROJECT_PATH, AT_DOCS_LANGUAGE_EN,
-        AT_DOCS_VERSION, CONFIG_IDF_TARGET, AT_DOCS_HOME_WEB_PAGE);
+                    cmd_name, AT_DOCS_SERVER_HOSTNAME, AT_DOCS_PROJECT_PATH, AT_DOCS_LANGUAGE_EN,
+                    AT_DOCS_VERSION, CONFIG_IDF_TARGET, AT_DOCS_HOME_WEB_PAGE);
 
     ret += snprintf((char *)buffer + ret, AT_USERDOCS_BUFFER_LEN_MAX - ret, "%s:\"https://%s/%s/%s/%s/%s/%s\"\r\n",
-        cmd_name, AT_DOCS_SERVER_HOSTNAME, AT_DOCS_PROJECT_PATH, AT_DOCS_LANGUAGE_CN,
-        AT_DOCS_VERSION, CONFIG_IDF_TARGET, AT_DOCS_HOME_WEB_PAGE);
+                    cmd_name, AT_DOCS_SERVER_HOSTNAME, AT_DOCS_PROJECT_PATH, AT_DOCS_LANGUAGE_CN,
+                    AT_DOCS_VERSION, CONFIG_IDF_TARGET, AT_DOCS_HOME_WEB_PAGE);
 
     esp_at_port_write_data(buffer, ret);
     free(buffer);
@@ -454,7 +564,9 @@ void at_set_mcu_state_if_sleep(at_sleep_mode_t mode)
     }
 
     if (s_wkmcu_cfg.enable) {
+        gpio_hold_dis(s_wkmcu_cfg.wake_number);
         gpio_set_level(s_wkmcu_cfg.wake_number, !s_wkmcu_cfg.wake_signal);
+        gpio_hold_en(s_wkmcu_cfg.wake_number);
     }
 
     return;
@@ -468,7 +580,9 @@ void at_wkmcu_if_config(at_write_data_fn_t write_data_fn)
 
     switch (s_wkmcu_cfg.wake_mode) {
     case WKMCU_MODE_GPIO:
+        gpio_hold_dis(s_wkmcu_cfg.wake_number);
         gpio_set_level(s_wkmcu_cfg.wake_number, s_wkmcu_cfg.wake_signal);
+        gpio_hold_en(s_wkmcu_cfg.wake_number);
         break;
 
     case WKMCU_MODE_UART:
@@ -490,7 +604,9 @@ void at_wkmcu_if_config(at_write_data_fn_t write_data_fn)
 
     // reverse wake up signal
     if (s_wkmcu_cfg.wake_mode == WKMCU_MODE_GPIO) {
+        gpio_hold_dis(s_wkmcu_cfg.wake_number);
         gpio_set_level(s_wkmcu_cfg.wake_number, !s_wkmcu_cfg.wake_signal);
+        gpio_hold_en(s_wkmcu_cfg.wake_number);
     }
 
     return;
@@ -597,7 +713,9 @@ static uint8_t at_setup_cmd_userwkmcucfg(uint8_t para_num)
             io_conf.pull_down_en = false;
             io_conf.intr_type = GPIO_INTR_DISABLE;
             gpio_config(&io_conf);
+            gpio_hold_dis(wk_number);
             gpio_set_level(wk_number, !wk_signal);
+            gpio_hold_en(wk_number);
         }
     } else {
         if (s_wkmcu_cfg.wake_mode == WKMCU_MODE_GPIO) {
@@ -658,7 +776,9 @@ static uint8_t at_setup_cmd_usermcusleep(uint8_t para_num)
         s_mcu_sleep = mcu_sleep;
 
         if (s_wkmcu_cfg.wake_mode == WKMCU_MODE_GPIO) {
+            gpio_hold_dis(s_wkmcu_cfg.wake_number);
             gpio_set_level(s_wkmcu_cfg.wake_number, !s_wkmcu_cfg.wake_signal);
+            gpio_hold_en(s_wkmcu_cfg.wake_number);
         }
     }
 
@@ -670,6 +790,7 @@ static const esp_at_cmd_struct s_at_user_cmd[] = {
     {"+USERRAM", NULL, at_query_cmd_userram, at_setup_cmd_userram, NULL},
     {"+USEROTA", NULL, NULL, at_setup_cmd_userota, NULL},
     {"+USERDOCS", NULL, at_query_cmd_userdocs, NULL, NULL},
+    {"+USERWGET", NULL, NULL, at_setup_cmd_userwget, NULL},
 #ifdef CONFIG_AT_USERWKMCU_COMMAND_SUPPORT
     {"+USERWKMCUCFG", NULL, NULL, at_setup_cmd_userwkmcucfg, NULL},
     {"+USERMCUSLEEP", NULL, NULL, at_setup_cmd_usermcusleep, NULL},
